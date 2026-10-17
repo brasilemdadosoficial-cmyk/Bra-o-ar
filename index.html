@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>Braço AR</title>
+<style>
+  :root { --acc:#22c55e; --bg:#000; --panel:rgba(15,15,18,.82); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:#fff;
+    font-family:system-ui,-apple-system,Roboto,sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  #gl, #dbg { position:absolute; max-width:100%; max-height:100%; width:auto; height:auto; }
+  #dbg { pointer-events:none; }
+  .mirror { transform:scaleX(-1); }
+  #status { position:fixed; top:max(10px,env(safe-area-inset-top)); left:10px; right:10px;
+    font-size:13px; background:var(--panel); padding:6px 10px; border-radius:10px; text-align:center; }
+  #fps { position:fixed; top:calc(max(10px,env(safe-area-inset-top)) + 34px); right:10px; font-size:11px; opacity:.7; }
+  #ui { position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(12px + env(safe-area-inset-bottom));
+    background:var(--panel); backdrop-filter:blur(8px); }
+  .row { display:flex; gap:8px; align-items:center; margin:6px 0; }
+  button { flex:1; border:0; border-radius:12px; padding:13px 8px; font-size:15px; font-weight:600;
+    background:#2a2a30; color:#fff; }
+  button.on { background:var(--acc); color:#04140a; }
+  button:disabled { opacity:.4; }
+  label { font-size:12px; min-width:92px; opacity:.85; }
+  input[type=range] { flex:1; accent-color:var(--acc); }
+  .chk { display:flex; align-items:center; gap:6px; font-size:12px; flex:1; }
+  #more { display:none; }
+  #more.open { display:block; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <canvas id="dbg"></canvas>
+</div>
+<div id="status">Toque em “Iniciar câmera”.</div>
+<div id="fps"></div>
+
+<div id="ui">
+  <div class="row">
+    <button id="btnCam">Iniciar câmera</button>
+    <button id="btnFx" disabled>Ativar efeito</button>
+  </div>
+  <div class="row">
+    <button id="btnFlip" disabled>Trocar câmera</button>
+    <button id="btnSide">Braço: esquerda da tela</button>
+    <button id="btnMore" style="flex:.5">⚙︎</button>
+  </div>
+  <div class="row">
+    <label>Altura</label>
+    <input id="height" type="range" min="0" max="100" value="70">
+  </div>
+  <div id="more">
+    <div class="row">
+      <label>Espessura braço</label>
+      <input id="thick" type="range" min="60" max="160" value="100">
+    </div>
+    <div class="row">
+      <label>Velocidade subida</label>
+      <input id="speed" type="range" min="10" max="100" value="45">
+    </div>
+    <div class="row">
+      <span class="chk"><input id="useBg" type="checkbox" checked> Memorizar fundo</span>
+      <span class="chk"><input id="showSk" type="checkbox"> Esqueleto</span>
+      <button id="btnBgReset" style="flex:1;padding:8px">Recapturar fundo</button>
+    </div>
+  </div>
+</div>
+
+<video id="video" playsinline muted autoplay style="display:none"></video>
+
+<script type="module">
+// ============================================================================
+//  Braço AR — manipulação em tempo real do braço real captado pela câmera
+//  MediaPipe Pose Landmarker (landmarks + máscara de pessoa) + WebGL2
+// ============================================================================
+const MP_VER = '0.10.14';
+const MP_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}`;
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+const $ = id => document.getElementById(id);
+const video = $('video'), glCanvas = $('gl'), dbg = $('dbg'), statusEl = $('status');
+const setStatus = t => statusEl.textContent = t;
+
+// ---------------------------------------------------------------- estado
+const S = {
+  stream:null, facing:'environment', running:false,
+  fxOn:false, prog:0,               // progresso da animação 0..1
+  sideLeft:true,                    // braço do lado esquerdo da TELA
+  lm:null, lmSmooth:null, lastSeen:0,
+  maskW:0, maskH:0, maskData:null, maskDirty:false,
+  bgReset:true, landmarker:null, lastTs:-1,
+};
+
+// ---------------------------------------------------------------- MediaPipe
+async function loadModel(){
+  setStatus('Carregando modelo de rastreamento corporal…');
+  const vision = await import(`${MP_URL}/vision_bundle.mjs`);
+  const fileset = await vision.FilesetResolver.forVisionTasks(`${MP_URL}/wasm`);
+  const opts = d => ({
+    baseOptions:{ modelAssetPath:MODEL_URL, delegate:d },
+    runningMode:'VIDEO', numPoses:1, outputSegmentationMasks:true,
+    minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5,
+  });
+  try { S.landmarker = await vision.PoseLandmarker.createFromOptions(fileset, opts('GPU')); }
+  catch(e){ console.warn('GPU falhou, usando CPU', e);
+            S.landmarker = await vision.PoseLandmarker.createFromOptions(fileset, opts('CPU')); }
+}
+
+// canvas pequeno para a detecção (mais rápido no celular)
+const det = document.createElement('canvas');
+const detCtx = det.getContext('2d', { willReadFrequently:false });
+
+function detect(now){
+  if(!S.landmarker) return;
+  const ts = Math.max(now, S.lastTs + 1); S.lastTs = ts;
+  detCtx.drawImage(video, 0, 0, det.width, det.height);
+  S.landmarker.detectForVideo(det, ts, res => {
+    if(res.landmarks && res.landmarks.length){
+      S.lm = res.landmarks[0]; S.lastSeen = now;
+    } else S.lm = null;
+    if(res.segmentationMasks && res.segmentationMasks.length){
+      const m = res.segmentationMasks[0];
+      S.maskW = m.width; S.maskH = m.height;
+      const f = m.getAsFloat32Array();
+      if(!S.maskData || S.maskData.length !== f.length) S.maskData = new Uint8Array(f.length);
+      for(let i=0;i<f.length;i++) S.maskData[i] = f[i] * 255;
+      S.maskDirty = true;
+    }
+  });
+}
+
+// ---------------------------------------------------------------- câmera
+async function startCamera(){
+  if(S.stream) S.stream.getTracks().forEach(t=>t.stop());
+  setStatus('Abrindo câmera…');
+  S.stream = await navigator.mediaDevices.getUserMedia({
+    audio:false,
+    video:{ facingMode:{ ideal:S.facing }, width:{ ideal:1280 }, height:{ ideal:720 }, frameRate:{ ideal:30 } }
+  });
+  video.srcObject = S.stream;
+  await video.play();
+  await new Promise(r => video.videoWidth ? r() : video.onloadedmetadata = r);
+  const W = video.videoWidth, H = video.videoHeight;
+  glCanvas.width = dbg.width = W; glCanvas.height = dbg.height = H;
+  const scale = 320 / Math.max(W, H);
+  det.width = Math.round(W*scale); det.height = Math.round(H*scale);
+  const mirror = S.facing === 'user';
+  glCanvas.classList.toggle('mirror', mirror); dbg.classList.toggle('mirror', mirror);
+  fitCanvas();
+  allocTargets(W, H);
+  S.bgReset = true; S.lmSmooth = null;
+}
+function fitCanvas(){
+  const W = glCanvas.width, H = glCanvas.height;
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  for(const c of [glCanvas, dbg]){ c.style.width = W*s+'px'; c.style.height = H*s+'px'; }
+}
+addEventListener('resize', fitCanvas);
+
+// ---------------------------------------------------------------- WebGL2
+const gl = glCanvas.getContext('webgl2', { premultipliedAlpha:false, antialias:false });
+if(!gl) setStatus('Este navegador não tem WebGL2. Use o Chrome atualizado.');
+
+const VS = `#version 300 es
+in vec2 aPos; void main(){ gl_Position = vec4(aPos,0.,1.); }`;
+
+const COMMON = `#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform sampler2D uCam, uMask;
+float maskAt(vec2 p){ return texture(uMask, p/uRes).r; }
+float maskDil(vec2 p, float r){
+  float m = maskAt(p);
+  m = max(m, maskAt(p+vec2(r,0.))); m = max(m, maskAt(p-vec2(r,0.)));
+  m = max(m, maskAt(p+vec2(0.,r))); m = max(m, maskAt(p-vec2(0.,r)));
+  return m;
+}
+float segDist(vec2 p, vec2 a, vec2 b, out float t){
+  vec2 ab = b-a; float l2 = max(dot(ab,ab), 1e-3);
+  t = dot(p-a, ab)/l2; float tc = clamp(t,0.,1.);
+  return length(p-(a+ab*tc));
+}
+out vec4 outColor;
+`;
+
+// modelo de fundo: memoriza o cenário atrás da pessoa ao longo do tempo
+const FS_BG = COMMON + `
+uniform sampler2D uPrev; uniform int uReset;
+void main(){
+  vec2 st = gl_FragCoord.xy/uRes;
+  vec2 uv = vec2(st.x, 1.-st.y);
+  vec2 p = uv*uRes;
+  vec3 cam = texture(uCam, uv).rgb;
+  vec4 prev = texture(uPrev, st);
+  float m = maskDil(p, uRes.x*0.025);
+  float freeA = 1. - smoothstep(0.15, 0.45, m);
+  if(uReset == 1){ outColor = vec4(cam, freeA*0.3); return; }
+  float k = prev.a < 0.05 ? freeA : freeA*0.12;
+  vec3 c = mix(prev.rgb, cam, k);
+  float a = clamp(prev.a*0.997 + freeA*0.04, 0., 1.);
+  outColor = vec4(c, a);
+}`;
+
+// composição final: remove o braço original e redesenha-o na nova pose
+const FS_COMP = COMMON + `
+uniform sampler2D uBg;
+uniform int uActive;
+uniform vec2 uO[4];   // ombro, cotovelo, pulso, ponta da mão (original)
+uniform vec2 uN[4];   // mesma cadeia, nova pose
+uniform float uRad[3];
+uniform float uBgUse, uAmt;
+vec3 cam(vec2 p){ return texture(uCam, p/uRes).rgb; }
+void main(){
+  vec2 uv = vec2(gl_FragCoord.x/uRes.x, 1.-gl_FragCoord.y/uRes.y);
+  vec2 p = uv*uRes;
+  vec3 base = cam(p);
+  if(uActive == 0){ outColor = vec4(base,1.); return; }
+
+  // ---------- 1) apagar o braço original e reconstruir o que fica descoberto
+  float best = 1e9, bt = 0.; int bi = 0;
+  for(int i=0;i<3;i++){ float t; float d = segDist(p,uO[i],uO[i+1],t)/uRad[i];
+    if(d < best){ best = d; bi = i; bt = t; } }
+  float remA = (1. - smoothstep(1.05, 1.45, best)) * smoothstep(0.1, 0.4, maskDil(p, uRad[bi]*0.35));
+  remA *= smoothstep(0.0, 0.25, uAmt);   // só apaga quando o braço já saiu do lugar
+  if(remA > 0.001){
+    vec2 a = uO[bi], b = uO[bi+1];
+    vec2 dir = normalize(b-a + vec2(1e-4));
+    vec2 nrm = vec2(-dir.y, dir.x);
+    vec2 c = a + (b-a)*clamp(bt,0.,1.);
+    float r = uRad[bi];
+    float s = dot(p-c, nrm)/r;                  // posição transversal
+    float along = dot(p-c, dir);
+    vec3 A = vec3(0.), B = vec3(0.);
+    for(int k=0;k<3;k++){                       // amostra pele/fundo dos dois lados
+      float off = r*(1.55 + 0.25*float(k));
+      vec2 j = dir*(float(k)-1.)*r*0.3 + dir*along*0.0;
+      A += cam(c + nrm*off + j); B += cam(c - nrm*off + j);
+    }
+    A /= 3.; B /= 3.;
+    vec3 fill = mix(B, A, smoothstep(-1.2, 1.2, s));
+    vec4 bg = texture(uBg, vec2(uv.x, 1.-uv.y));
+    fill = mix(fill, bg.rgb, smoothstep(0.35, 0.9, bg.a) * uBgUse);
+    base = mix(base, fill, remA);
+  }
+
+  // ---------- 2) desenhar o braço real deslocado (mapeamento inverso por osso)
+  best = 1e9; bi = 0;
+  for(int i=0;i<3;i++){ float t; float d = segDist(p,uN[i],uN[i+1],t)/uRad[i];
+    if(d < best){ best = d; bi = i; } }
+  if(best < 1.2){
+    vec2 a = uN[bi], b = uN[bi+1]; float L = max(length(b-a), 1.);
+    vec2 dir = (b-a)/L, nrm = vec2(-dir.y, dir.x);
+    float along = dot(p-a, dir), side = dot(p-a, nrm);
+    vec2 a0 = uO[bi], b0 = uO[bi+1]; float L0 = max(length(b0-a0), 1.);
+    vec2 d0 = (b0-a0)/L0, n0 = vec2(-d0.y, d0.x);
+    vec2 src = a0 + d0*(along*L0/L) + n0*side;
+    float armA = (1. - smoothstep(0.82, 1.08, best)) * smoothstep(0.35, 0.7, maskAt(src));
+    // não puxar pixels de fora da imagem
+    armA *= step(0., src.x)*step(0., src.y)*step(src.x, uRes.x)*step(src.y, uRes.y);
+    base = mix(base, cam(src), armA);
+  }
+  outColor = vec4(base, 1.);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'aPos'); gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for(let i=0;i<n;i++){ const info = gl.getActiveUniform(p,i); const nm = info.name.replace('[0]','');
+    u[nm] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+const progBg = program(FS_BG), progComp = program(FS_COMP);
+
+const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+function tex(){
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+const camTex = tex(), maskTex = tex();
+gl.bindTexture(gl.TEXTURE_2D, maskTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+let bgTex = [null,null], bgFbo = [null,null], bgIdx = 0;
+function allocTargets(W, H){
+  for(let i=0;i<2;i++){
+    if(bgTex[i]) gl.deleteTexture(bgTex[i]);
+    bgTex[i] = tex();
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    if(!bgFbo[i]) bgFbo[i] = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bgFbo[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, bgTex[i], 0);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// ---------------------------------------------------------------- geometria do braço
+const deg = Math.PI/180;
+const lerp = (a,b,t) => a + (b-a)*t;
+const ease = t => t<.5 ? 2*t*t : 1 - Math.pow(-2*t+2, 2)/2;
+function smoothLandmarks(lm, W, H){
+  const pts = lm.map(l => ({ x:l.x*W, y:l.y*H, v:l.visibility ?? 1 }));
+  if(!S.lmSmooth) { S.lmSmooth = pts; return pts; }
+  const k = 0.55;
+  S.lmSmooth = S.lmSmooth.map((o,i) => ({ x:lerp(o.x,pts[i].x,k), y:lerp(o.y,pts[i].y,k), v:pts[i].v }));
+  return S.lmSmooth;
+}
+// ângulo medido a partir de "para cima", positivo para fora do corpo
+const angOf = (dx, dy, o) => Math.atan2(o*dx, -dy);
+const dirOf = (th, o) => [o*Math.sin(th), -Math.cos(th)];
+function unwrapNear(th, target){
+  let d = th - target; while(d > Math.PI) d -= 2*Math.PI; while(d < -Math.PI) d += 2*Math.PI;
+  return target + d;
+}
+
+function computeArm(P, W){
+  // índices MediaPipe: 11/12 ombros, 13/14 cotovelos, 15/16 pulsos, 17/18 mindinho, 19/20 indicador
+  const mirror = S.facing === 'user';
+  const lIsLeftOnScreen = mirror ? P[11].x > P[12].x : P[11].x < P[12].x;
+  const useA = (S.sideLeft === lIsLeftOnScreen);
+  const [s,e,w,pk,ix,os] = useA ? [11,13,15,17,19,12] : [12,14,16,18,20,11];
+  if(P[s].v < .5 || P[e].v < .4 || P[w].v < .3) return null;
+  const Sh = P[s], El = P[e], Wr = P[w], Ot = P[os];
+  const sw = Math.hypot(Sh.x-Ot.x, Sh.y-Ot.y);
+  if(sw < 20) return null;
+  let Tp;
+  if(P[ix].v > .3 && P[pk].v > .3){
+    const mx = (P[ix].x+P[pk].x)/2, my = (P[ix].y+P[pk].y)/2;
+    Tp = { x:Wr.x + (mx-Wr.x)*1.7, y:Wr.y + (my-Wr.y)*1.7 };
+  } else Tp = { x:Wr.x + (Wr.x-El.x)*.35, y:Wr.y + (Wr.y-El.y)*.35 };
+
+  const o = Math.sign(Sh.x - Ot.x) || 1;     // lado "para fora" na imagem
+  const L1 = Math.hypot(El.x-Sh.x, El.y-Sh.y);
+  const L2 = Math.hypot(Wr.x-El.x, Wr.y-El.y);
+  const L3 = Math.hypot(Tp.x-Wr.x, Tp.y-Wr.y);
+
+  const h = $('height').value/100;
+  const tU = lerp(80, 12, h)*deg;            // braço: quase horizontal → vertical
+  const tF = lerp(22,  2, h)*deg;            // antebraço apontando para cima
+  const t  = ease(S.prog);
+
+  const aU = lerp(unwrapNear(angOf(El.x-Sh.x, El.y-Sh.y, o), tU), tU, t);
+  const aF = lerp(unwrapNear(angOf(Wr.x-El.x, Wr.y-El.y, o), tF), tF, t);
+  const aH = lerp(unwrapNear(angOf(Tp.x-Wr.x, Tp.y-Wr.y, o), tF), tF, t);
+  const dU = dirOf(aU,o), dF = dirOf(aF,o), dH = dirOf(aH,o);
+  const E2 = { x:Sh.x + dU[0]*L1, y:Sh.y + dU[1]*L1 };
+  const W2 = { x:E2.x + dF[0]*L2, y:E2.y + dF[1]*L2 };
+  const T2 = { x:W2.x + dH[0]*L3, y:W2.y + dH[1]*L3 };
+
+  const th = $('thick').value/100;
+  return {
+    O:[Sh,El,Wr,Tp], N:[Sh,E2,W2,T2],
+    R:[0.21*sw*th, 0.16*sw*th, 0.20*sw*th],
+  };
+}
+
+// ---------------------------------------------------------------- loop
+let lastFrame = performance.now(), fpsAcc = 0, fpsN = 0;
+function frame(now){
+  if(!S.running) return;
+  requestAnimationFrame(frame);
+  if(video.readyState < 2) return;
+  const W = glCanvas.width, H = glCanvas.height;
+  const dt = Math.min(0.1, (now - lastFrame)/1000); lastFrame = now;
+  fpsAcc += dt; fpsN++; if(fpsAcc > 1){ $('fps').textContent = Math.round(fpsN/fpsAcc)+' fps'; fpsAcc = 0; fpsN = 0; }
+
+  detect(now);
+
+  // animação de subida/descida
+  const sp = $('speed').value/100 * 2.5;
+  S.prog = S.fxOn ? Math.min(1, S.prog + dt*sp) : Math.max(0, S.prog - dt*sp);
+
+  // texturas
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.bindTexture(gl.TEXTURE_2D, camTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  if(S.maskDirty){
+    gl.bindTexture(gl.TEXTURE_2D, maskTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, S.maskW, S.maskH, 0, gl.RED, gl.UNSIGNED_BYTE, S.maskData);
+    S.maskDirty = false;
+  }
+
+  const arm = (S.lm && now - S.lastSeen < 300) ? computeArm(smoothLandmarks(S.lm, W, H), W) : null;
+  if(S.fxOn) setStatus(arm ? 'Efeito ativo' : 'Procurando pessoa… enquadre ombros, cotovelo e mão');
+
+  gl.viewport(0, 0, W, H);
+  // ---- passe 1: atualiza modelo de fundo
+  const src = bgIdx, dst = 1 - bgIdx;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bgFbo[dst]);
+  gl.useProgram(progBg.p);
+  gl.uniform2f(progBg.u.uRes, W, H);
+  bindTex(0, camTex, progBg.u.uCam); bindTex(1, maskTex, progBg.u.uMask); bindTex(2, bgTex[src], progBg.u.uPrev);
+  gl.uniform1i(progBg.u.uReset, S.bgReset ? 1 : 0); S.bgReset = false;
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  bgIdx = dst;
+
+  // ---- passe 2: composição
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.useProgram(progComp.p);
+  gl.uniform2f(progComp.u.uRes, W, H);
+  bindTex(0, camTex, progComp.u.uCam); bindTex(1, maskTex, progComp.u.uMask); bindTex(2, bgTex[bgIdx], progComp.u.uBg);
+  const active = arm && S.prog > 0.001;
+  gl.uniform1i(progComp.u.uActive, active ? 1 : 0);
+  if(active){
+    gl.uniform2fv(progComp.u.uO, arm.O.flatMap(q=>[q.x,q.y]));
+    gl.uniform2fv(progComp.u.uN, arm.N.flatMap(q=>[q.x,q.y]));
+    gl.uniform1fv(progComp.u.uRad, arm.R);
+    gl.uniform1f(progComp.u.uBgUse, $('useBg').checked ? 1 : 0);
+    gl.uniform1f(progComp.u.uAmt, ease(S.prog));
+  }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  drawDebug(arm);
+}
+function bindTex(unit, t, loc){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(loc, unit); }
+
+const dctx = dbg.getContext('2d');
+function drawDebug(arm){
+  dctx.clearRect(0,0,dbg.width,dbg.height);
+  if(!$('showSk').checked || !arm) return;
+  const line = (pts, col) => { dctx.strokeStyle = col; dctx.lineWidth = 4; dctx.beginPath();
+    pts.forEach((q,i)=> i ? dctx.lineTo(q.x,q.y) : dctx.moveTo(q.x,q.y)); dctx.stroke();
+    pts.forEach(q => { dctx.fillStyle = col; dctx.beginPath(); dctx.arc(q.x,q.y,6,0,7); dctx.fill(); }); };
+  line(arm.O, 'rgba(255,80,80,.9)'); line(arm.N, 'rgba(34,197,94,.95)');
+}
+
+// ---------------------------------------------------------------- UI
+$('btnCam').onclick = async () => {
+  try{
+    if(!window.isSecureContext){ setStatus('A câmera exige HTTPS. Veja o LEIA-ME.'); return; }
+    $('btnCam').disabled = true;
+    if(!S.landmarker) await loadModel();
+    await startCamera();
+    S.running = true; requestAnimationFrame(frame);
+    $('btnFx').disabled = false; $('btnFlip').disabled = false;
+    $('btnCam').textContent = 'Câmera ligada';
+    setStatus('Aponte para uma pessoa de corpo inteiro ou da cintura para cima.');
+  }catch(e){
+    console.error(e); $('btnCam').disabled = false;
+    setStatus('Erro: ' + (e.name === 'NotAllowedError' ? 'permissão da câmera negada.' : e.message));
+  }
+};
+$('btnFx').onclick = () => {
+  S.fxOn = !S.fxOn;
+  $('btnFx').classList.toggle('on', S.fxOn);
+  $('btnFx').textContent = S.fxOn ? 'Desativar efeito' : 'Ativar efeito';
+  if(!S.fxOn) setStatus('Efeito desligado');
+};
+$('btnFlip').onclick = async () => {
+  S.facing = S.facing === 'environment' ? 'user' : 'environment';
+  try { await startCamera(); } catch(e){ setStatus('Erro ao trocar câmera: ' + e.message); }
+};
+$('btnSide').onclick = () => {
+  S.sideLeft = !S.sideLeft;
+  $('btnSide').textContent = 'Braço: ' + (S.sideLeft ? 'esquerda' : 'direita') + ' da tela';
+};
+$('btnMore').onclick = () => $('more').classList.toggle('open');
+$('btnBgReset').onclick = () => { S.bgReset = true; };
+document.addEventListener('visibilitychange', () => { if(document.hidden) S.lastTs = performance.now(); });
+</script>
+</body>
+</html>
